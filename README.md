@@ -126,6 +126,50 @@ ctest --test-dir build -C Release --output-on-failure
 | `client/client.cpp` | Klijent za terminal |
 | `tests/tests.cpp` | Testovi (bez mreže, jer jezgra ne ovisi o socketima) |
 
+## Performanse
+
+U mapi `bench/` je benchmark koji spoji više klijenata na server i svi istovremeno šalju naredbe. Za svaki test mjeri propusnost (naredbi u sekundi) i trajanje pojedine naredbe (p50 = medijan, p99 = 99 % naredbi je brže od te vrijednosti).
+
+Svaki klijent šalje naredbu i čeka odgovor prije sljedeće (bez pipelininga). Po testu se šalje ukupno 100 000 naredbi, ravnomjerno podijeljenih na klijente.
+
+### Pokretanje
+
+```bash
+# prevođenje (MSYS2 / MinGW); važno je -O2
+g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0601 src/*.cpp -o mini_redis.exe -lws2_32
+g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0601 bench/bench.cpp -o mini_redis_bench.exe -lws2_32
+
+# terminal 1: server na posebnom portu i s posebnom AOF datotekom
+./mini_redis.exe 7001 bench.aof
+
+# terminal 2: benchmark
+./mini_redis_bench.exe 7001
+```
+
+S CMakeom se benchmark gradi kao `mini_redis_bench`.
+
+### Rezultati
+
+Windows, 16 logičkih jezgri, Release build, klijenti i server na istom računalu (127.0.0.1).
+
+| Klijenata | SET naredbi/s | SET p50 / p99 (µs) | GET naredbi/s | GET p50 / p99 (µs) |
+|---:|---:|---:|---:|---:|
+| 1  | 28 633 | 33 / 72     | 41 391  | 23 / 53  |
+| 2  | 53 557 | 35 / 79     | 79 532  | 24 / 54  |
+| 4  | 68 002 | 54 / 122    | 137 037 | 28 / 38  |
+| 8  | 67 364 | 60 / 475    | 203 846 | 39 / 51  |
+| 16 | 65 984 | 228 / 1 085 | 255 331 | 58 / 128 |
+| 32 | 66 086 | 453 / 2 618 | 258 247 | 71 / 410 |
+
+### Što rezultati pokazuju
+
+- **GET skalira dobro:** s 1 na 16 klijenata propusnost raste oko 6×, do otprilike 255 000 naredbi/s. Iznad toga se više ne povećava, vjerojatno zato što klijenti i server dijele iste jezgre.
+- **SET zastane na otprilike 67 000 naredbi/s već kod 4 klijenta**, a kašnjenje dalje raste. GET i SET koriste isti mutex, pa uzrok nije sam mutex, nego to što SET, dok ga drži, piše u `data.aof` i radi `flush()`. Za to vrijeme svi ostali klijenti čekaju.
+
+### Sljedeći korak
+
+Izvući pisanje na disk izvan mutexa: SET samo doda redak u red čekanja, a zaseban thread ga periodički zapiše na disk (slično Redisovoj opciji `appendfsync everysec`). Cijena je to da se u slučaju pada servera mogu izgubiti zadnje milisekunde promjena.
+
 **Nekoliko zanimljivih detalja:**
 
 - **TCP je tok bajtova, a ne poruka.** Jedan `recv()` može vratiti pola naredbe ili dvije naredbe odjednom. Server zato sve skuplja u buffer i obrađuje tek cijele retke (do `\n`).
@@ -139,4 +183,3 @@ ctest --test-dir build -C Release --output-on-failure
 - Event loop s `poll()`/`epoll` umjesto threada po klijentu
 - Sažimanje AOF datoteke (trenutno samo raste)
 - Vrijednosti s razmacima (navodnici u parseru)
-- Benchmark: koliko naredbi u sekundi server obradi
