@@ -33,10 +33,15 @@ target_link_libraries(mini_redis PRIVATE redis_core)
 add_executable(mini_redis_client client/client.cpp)
 target_link_libraries(mini_redis_client PRIVATE Threads::Threads)
 
+# Benchmark
+add_executable(mini_redis_bench bench/bench.cpp)
+target_link_libraries(mini_redis_bench PRIVATE Threads::Threads)
+
 # Na Windowsu mrezne funkcije zive u biblioteci ws2_32
 if(WIN32)
     target_link_libraries(mini_redis PRIVATE ws2_32)
     target_link_libraries(mini_redis_client PRIVATE ws2_32)
+    target_link_libraries(mini_redis_bench PRIVATE ws2_32)
 endif()
 
 # Testovi
