@@ -166,10 +166,6 @@ Windows, 16 logičkih jezgri, Release build, klijenti i server na istom računal
 - **GET skalira dobro:** s 1 na 16 klijenata propusnost raste oko 6×, do otprilike 255 000 naredbi/s. Iznad toga se više ne povećava, vjerojatno zato što klijenti i server dijele iste jezgre.
 - **SET zastane na otprilike 67 000 naredbi/s već kod 4 klijenta**, a kašnjenje dalje raste. GET i SET koriste isti mutex, pa uzrok nije sam mutex, nego to što SET, dok ga drži, piše u `data.aof` i radi `flush()`. Za to vrijeme svi ostali klijenti čekaju.
 
-### Sljedeći korak
-
-Izvući pisanje na disk izvan mutexa: SET samo doda redak u red čekanja, a zaseban thread ga periodički zapiše na disk (slično Redisovoj opciji `appendfsync everysec`). Cijena je to da se u slučaju pada servera mogu izgubiti zadnje milisekunde promjena.
-
 **Nekoliko zanimljivih detalja:**
 
 - **TCP je tok bajtova, a ne poruka.** Jedan `recv()` može vratiti pola naredbe ili dvije naredbe odjednom. Server zato sve skuplja u buffer i obrađuje tek cijele retke (do `\n`).
