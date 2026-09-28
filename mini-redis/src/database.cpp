@@ -2,6 +2,7 @@
 
 #include "parser.hpp"
 
+#include <chrono>
 #include <iostream>
 
 namespace {
@@ -29,6 +30,38 @@ Database::Database(const std::string& aof_path) {
     if (!aof_file_) {
         std::cerr << "Upozorenje: ne mogu otvoriti " << aof_path
                   << ", podaci se nece spremati na disk.\n";
+        return;
+    }
+
+    // Datoteka je otvorena: pokreni thread koji ju periodicki flusha
+    running_ = true;
+    flusher_ = std::thread(&Database::flush_loop, this);
+}
+
+Database::~Database() {
+    if (flusher_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            running_ = false;
+        }
+        flush_cv_.notify_one();  // probudi flusher odmah, ne cekaj da istekne sekunda
+        flusher_.join();         // pricekaj da zavrsi
+    }
+    if (aof_file_.is_open()) {
+        aof_file_.flush();  // zadnji flush: nista ne smije ostati u bufferu
+    }
+}
+
+void Database::flush_loop() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (running_) {
+        // wait_for OTKLJUCA mutex dok spava, pa klijenti mogu normalno raditi.
+        // Budi se nakon 1 s ili ranije ako destruktor postavi running_ = false.
+        flush_cv_.wait_for(lock, std::chrono::seconds(1), [this] { return !running_; });
+
+        // Ovdje je mutex opet zakljucan, pa nitko ne pise u aof_file_ dok ga flushamo
+        // (ofstream nije siguran za istovremeno koristenje iz vise threadova).
+        aof_file_.flush();
     }
 }
 
@@ -51,8 +84,9 @@ void Database::load_aof(const std::string& path) {
 
 void Database::append_to_aof(const std::string& line) {
     if (aof_file_.is_open()) {
-        aof_file_ << line << "\n";
-        aof_file_.flush();  // odmah zapisi na disk, ne cekaj
+        // Samo u buffer. Na disk ce ga poslati flush_loop (najkasnije za ~1 s)
+        // ili destruktor pri gasenju.
+        aof_file_ << line << '\n';
     }
 }
 
