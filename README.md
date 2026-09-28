@@ -21,10 +21,11 @@ ime
 
 - **TCP server:** sluša na portu (zadano `7000`) i prima naredbe u obliku teksta, jedna naredba po retku
 - **Više klijenata istovremeno:** svaki klijent radi u svom threadu, a pristup podacima štiti `std::mutex`
-- **Spremanje na disk (AOF):** svaka promjena se dopisuje u `data.aof` i ponovno izvrši pri pokretanju
+- **Spremanje na disk (AOF):** svaka promjena se dopisuje u `data.aof` i ponovno izvrši pri pokretanju; zaseban thread jednom u sekundi šalje buffer na disk, pa klijenti ne čekaju disk
 - **Istek ključeva (TTL):** ključ može automatski nestati nakon zadanog broja sekundi
 - **Ispravno čitanje s mreže:** naredbe se skupljaju u buffer, pa radi i kad naredba stigne u dijelovima
 - **Testovi:** 49 provjera za parser, pohranu, naredbe, spremanje na disk i rad s više threadova
+- **Benchmark:** vlastiti alat za mjerenje opterećenja; SET je nakon optimizacije ~2,5× brži (vidi [Performanse](#performanse))
 
 ## Naredbe
 
@@ -44,7 +45,35 @@ Naredbe nisu osjetljive na velika i mala slova (`set` = `SET`). Ključevi i vrij
 
 ## Build i pokretanje
 
-Potreban je C++17 prevoditelj i [CMake](https://cmake.org/download/) 3.14+.
+Potreban je C++17 prevoditelj (npr. g++ iz [MSYS2](https://www.msys2.org/) na Windowsu). CMake nije obavezan.
+
+### Windows (g++ / MSYS2, može i iz terminala u VS Codeu)
+
+Sve naredbe se pokreću iz mape projekta (one u kojoj su `src`, `client`, `bench`...).
+
+```bash
+# prevođenje: server, klijent i benchmark (-O2 = optimizirano)
+g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0601 src/main.cpp src/server.cpp src/store.cpp src/parser.cpp src/database.cpp -o mini_redis.exe -lws2_32
+g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0601 client/client.cpp -o mini_redis_client.exe -lws2_32
+g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0601 bench/bench.cpp -o mini_redis_bench.exe -lws2_32
+
+# terminal 1: server
+./mini_redis.exe
+
+# terminal 2: klijent
+./mini_redis_client.exe
+```
+
+U VS Codeu drugi terminal otvoriš gumbom *Split Terminal*. Server se gasi s Ctrl+C.
+
+Testovi:
+
+```bash
+g++ -std=c++17 -O2 -Isrc src/store.cpp src/parser.cpp src/database.cpp tests/tests.cpp -o tests.exe
+./tests.exe
+```
+
+S CMakeom (3.14+) projekt se može graditi i na načine opisane dolje.
 
 ### Windows (Visual Studio)
 
@@ -68,7 +97,7 @@ build\Release\mini_redis_client.exe
 ### Linux / macOS
 
 ```bash
-cmake -S . -B build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
 ./build/mini_redis             # terminal 1: server
@@ -125,32 +154,37 @@ ctest --test-dir build -C Release --output-on-failure
 | `src/main.cpp` | Čita argumente i pokreće server |
 | `client/client.cpp` | Klijent za terminal |
 | `tests/tests.cpp` | Testovi (bez mreže, jer jezgra ne ovisi o socketima) |
+| `bench/bench.cpp` | Benchmark: više klijenata istovremeno, mjeri propusnost i kašnjenje |
+
+**Nekoliko zanimljivih detalja:**
+
+- **TCP je tok bajtova, a ne poruka.** Jedan `recv()` može vratiti pola naredbe ili dvije naredbe odjednom. Server zato sve skuplja u buffer i obrađuje tek cijele retke (do `\n`).
+- **Jedan mutex za podatke i AOF.** Kad bi podaci i datoteka imali svaki svoj lokot, dva klijenta bi mogla promijeniti podatke jednim redoslijedom, a zapisati ih u datoteku drugim. Nakon restarta stanje bi tada bilo drugačije.
+- **Lazy expiration.** Istekli ključ se ne briše točno u sekundi isteka, nego tek kad ga netko pokuša pročitati. Isto radi i pravi Redis.
+- **AOF se flusha jednom u sekundi.** Naredba samo dopiše redak u buffer datoteke, a zaseban thread ga svake sekunde pošalje operacijskom sustavu. Thread čeka na `std::condition_variable`, pa se pri gašenju odmah probudi i napravi zadnji flush. Cijena: ako se server sruši ili ga ugasimo s Ctrl+C, mogu se izgubiti promjene iz zadnje ~1 sekunde (isto kao Redisova opcija `appendfsync everysec`).
+- **EXPIRE se u AOF zapisuje kao točan trenutak** (`PEXPIREAT kljuc <ms>`), a ne kao "za 10 sekundi". Tako se odbrojavanje ne resetira nakon restarta.
 
 ## Performanse
 
-U mapi `bench/` je benchmark koji spoji više klijenata na server i svi istovremeno šalju naredbe. Za svaki test mjeri propusnost (naredbi u sekundi) i trajanje pojedine naredbe (p50 = medijan, p99 = 99 % naredbi je brže od te vrijednosti).
-
-Svaki klijent šalje naredbu i čeka odgovor prije sljedeće (bez pipelininga). Po testu se šalje ukupno 100 000 naredbi, ravnomjerno podijeljenih na klijente.
+`bench/bench.cpp` spoji 1–32 klijenta na server i svi istovremeno šalju naredbe. Svaki klijent šalje naredbu i čeka odgovor prije sljedeće (bez pipelininga). Po testu se šalje ukupno 100 000 naredbi, ravnomjerno podijeljenih na klijente. Mjeri se propusnost (naredbi u sekundi) i trajanje naredbe: p50 je medijan, a p99 vrijednost od koje je 99 % naredbi brže.
 
 ### Pokretanje
 
 ```bash
-# prevođenje (MSYS2 / MinGW); važno je -O2
-g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0601 src/*.cpp -o mini_redis.exe -lws2_32
-g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0601 bench/bench.cpp -o mini_redis_bench.exe -lws2_32
-
-# terminal 1: server na posebnom portu i s posebnom AOF datotekom
+# terminal 1: server na posebnom portu i s posebnom AOF datotekom, da benchmark ne napuni data.aof
 ./mini_redis.exe 7001 bench.aof
 
-# terminal 2: benchmark
-./mini_redis_bench.exe 7001
+# terminal 2
+./mini_redis_bench.exe 7001        # opcionalno: ./mini_redis_bench.exe 7001 200000
 ```
 
-S CMakeom se benchmark gradi kao `mini_redis_bench`.
+Nakon mjerenja ugasi server (Ctrl+C) i obriši `bench.aof`.
 
 ### Rezultati
 
-Windows, 16 logičkih jezgri, Release build, klijenti i server na istom računalu (127.0.0.1).
+Windows, 16 logičkih jezgri, g++ `-O2`, klijenti i server na istom računalu (127.0.0.1).
+
+**Prije optimizacije** (`flush()` nakon svake naredbe koja mijenja podatke):
 
 | Klijenata | SET naredbi/s | SET p50 / p99 (µs) | GET naredbi/s | GET p50 / p99 (µs) |
 |---:|---:|---:|---:|---:|
@@ -161,17 +195,24 @@ Windows, 16 logičkih jezgri, Release build, klijenti i server na istom računal
 | 16 | 65 984 | 228 / 1 085 | 255 331 | 58 / 128 |
 | 32 | 66 086 | 453 / 2 618 | 258 247 | 71 / 410 |
 
+**Nakon optimizacije** (flush jednom u sekundi, u zasebnom threadu):
+
+| Klijenata | SET naredbi/s | SET p50 / p99 (µs) | GET naredbi/s | GET p50 / p99 (µs) |
+|---:|---:|---:|---:|---:|
+| 1  | 37 551  | 23 / 69    | 40 494  | 23 / 72  |
+| 2  | 67 353  | 26 / 68    | 72 720  | 25 / 69  |
+| 4  | 111 925 | 31 / 63    | 131 666 | 29 / 41  |
+| 8  | 146 806 | 43 / 105   | 180 163 | 42 / 60  |
+| 16 | 160 731 | 94 / 312   | 170 328 | 48 / 100 |
+| 32 | 162 569 | 209 / 732  | 223 602 | 76 / 221 |
+
 ### Što rezultati pokazuju
 
-- **GET skalira dobro:** s 1 na 16 klijenata propusnost raste oko 6×, do otprilike 255 000 naredbi/s. Iznad toga se više ne povećava, vjerojatno zato što klijenti i server dijele iste jezgre.
-- **SET zastane na otprilike 67 000 naredbi/s već kod 4 klijenta**, a kašnjenje dalje raste. GET i SET koriste isti mutex, pa uzrok nije sam mutex, nego to što SET, dok ga drži, piše u `data.aof` i radi `flush()`. Za to vrijeme svi ostali klijenti čekaju.
-
-**Nekoliko zanimljivih detalja:**
-
-- **TCP je tok bajtova, a ne poruka.** Jedan `recv()` može vratiti pola naredbe ili dvije naredbe odjednom. Server zato sve skuplja u buffer i obrađuje tek cijele retke (do `\n`).
-- **Jedan mutex za podatke i AOF.** Kad bi podaci i datoteka imali svaki svoj lokot, dva klijenta bi mogla promijeniti podatke jednim redoslijedom, a zapisati ih u datoteku drugim. Nakon restarta stanje bi tada bilo drugačije.
-- **Lazy expiration.** Istekli ključ se ne briše točno u sekundi isteka, nego tek kad ga netko pokuša pročitati. Isto radi i pravi Redis.
-- **EXPIRE se u AOF zapisuje kao točan trenutak** (`PEXPIREAT kljuc <ms>`), a ne kao "za 10 sekundi". Tako se odbrojavanje ne resetira nakon restarta.
+- **Prije:** GET je rastao do ~255 000 naredbi/s, a SET je već kod 4 klijenta zapeo na ~67 000/s, uz p99 do 2,6 ms. Obje naredbe koriste isti mutex, pa uzrok nije sam mutex, nego to što je SET dok ga drži radio `flush()` na datoteku. Za to vrijeme svi ostali klijenti su čekali.
+- **Provjera hipoteze:** samo uklanjanje `flush()` (kao eksperiment) podiglo je SET na ~166 000/s. Time je potvrđeno da je flush usko grlo.
+- **Nakon:** SET s 32 klijenta obradi ~163 000 naredbi/s (**~2,5× više**), a p99 je pao s 2,6 ms na 0,7 ms.
+- SET je i dalje nešto sporiji od GET-a pri većem broju klijenata, jer dok drži mutex radi više posla: umeće novi ključ u hash tablicu (alokacija, povremeno rehash) i dopisuje redak u buffer datoteke.
+- Rezultati variraju ±5–10 % između pokretanja.
 
 ## Moguća proširenja
 
